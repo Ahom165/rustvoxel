@@ -131,11 +131,31 @@ pub struct Server {
 }
 
 // -------------------------------------------------------------- save / load
+/// Chemin de sauvegarde par défaut : le dossier de l'exécutable (même
+/// emplacement que le jeu, app.rs/win32::exe_dir) — insensible au répertoire
+/// courant de lancement, sinon le serveur crée un monde neuf à graine
+/// aléatoire selon d'où il est démarré.
+pub fn default_world_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("rustvoxel_world.sav")))
+        .unwrap_or_else(|| std::path::PathBuf::from("rustvoxel_world.sav"))
+}
+
 /// Sauve les chunks modifiés (format RVX2, compatible v0.5+).
+/// La version précédente est d'abord renommée en `<chemin>.bak` : un écrasement
+/// accidentel (serveur lancé avec un autre paramétrage, monde effacé côté
+/// client…) reste récupérable d'une génération.
 pub fn save_world(w: &World, path: &std::path::Path) -> std::io::Result<()> {
     use std::io::BufWriter;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
+    }
+    if path.exists() {
+        let mut bak = path.as_os_str().to_os_string();
+        bak.push(".bak");
+        let bak = std::path::PathBuf::from(bak);
+        std::fs::rename(path, &bak).ok();
     }
     let f = std::fs::File::create(path)?;
     let mut bw = BufWriter::new(f);
@@ -2901,6 +2921,39 @@ mod tests {
         assert_eq!(w2.seed, 99);
         assert_eq!(w2.get_block(3, 70, 3), crate::world::CHERRY_LOG);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_world_rotates_previous_to_bak() {
+        // Deux sauvegardes successives : la version d'avant doit survivre en
+        // .bak (filet anti-écrasement : serveur relancé avec un autre
+        // paramétrage, monde effacé côté client, etc.).
+        let path = std::env::temp_dir().join(format!("rvx_bak_{}.sav", std::process::id()));
+        let mut bak = path.clone().into_os_string();
+        bak.push(".bak");
+        let bak = std::path::PathBuf::from(bak);
+        let mut w = World::new(11);
+        w.gen_chunk(0, 0);
+        w.set_block(1, 70, 1, crate::world::STONE);
+        save_world(&w, &path).unwrap();
+        w.set_block(1, 70, 1, crate::world::PLANKS);
+        save_world(&w, &path).unwrap();
+        assert!(bak.exists(), "la version précédente doit exister en .bak");
+        assert_eq!(load_world(&bak).unwrap().get_block(1, 70, 1), crate::world::STONE);
+        assert_eq!(load_world(&path).unwrap().get_block(1, 70, 1), crate::world::PLANKS);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&bak).ok();
+    }
+
+    #[test]
+    fn default_world_path_is_absolute_next_to_exe() {
+        let p = default_world_path();
+        assert!(p.is_absolute(), "chemin absolu attendu, obtenu {:?}", p);
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some("rustvoxel_world.sav"),
+            "même nom de sauvegarde que le jeu solo"
+        );
     }
 
     #[test]

@@ -5,7 +5,17 @@
 //                    [--view N] [--world path] [--no-save-interval]
 //
 // Console commands: /help /list /time /tp /gamemode /kick /say /seed /save /stop
-use rustvoxel::server::{serve, ServerConfig};
+//
+// Monde par défaut : <dossier de l'exécutable>/rustvoxel_world.sav — le MÊME
+// fichier que le jeu solo. Le client officiel (via ViaFabricPlus) voit donc le
+// monde du jeu sans option particulière, quel que soit le répertoire de
+// lancement du serveur. Ctrl+C / fermeture de la console (Windows) déclenchent
+// une sauvegarde propre ; chaque sauvegarde préserve la version précédente en
+// .bak.
+use rustvoxel::server::{serve, default_world_path, ServerConfig};
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -15,6 +25,49 @@ fn arg(name: &str) -> Option<String> {
         .position(|a| a == name || a == &format!("--{name}"))
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+// ---------------------------------------------------------------- Ctrl+C / fermeture console (Windows)
+// Le handler signale l'arrêt puis attend (max ~4 s) que la boucle principale
+// ait terminé sa sauvegarde finale — au retour du handler sur CTRL_CLOSE_EVENT
+// le processus est tué par le système, il faut donc avoir fini avant.
+#[cfg(windows)]
+static RUNNING_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+#[cfg_attr(not(windows), allow(dead_code))]
+static SAVED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+extern "system" fn on_ctrl(_ctrl: u32) -> i32 {
+    unsafe {
+        if let Some(flag) = RUNNING_PTR.load(Ordering::SeqCst).as_ref() {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+    // laisse la boucle serveur sauvegarder avant que Windows ne tue le process
+    for _ in 0..400 {
+        if SAVED.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    1 // TRUE = géré : pas de fin de force par le runtime
+}
+
+#[cfg(windows)]
+fn install_ctrl_handler(running: &Arc<AtomicBool>) -> bool {
+    use std::os::raw::c_int;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<extern "system" fn(u32) -> c_int>,
+            add: c_int,
+        ) -> c_int;
+    }
+    RUNNING_PTR.store(
+        Arc::into_raw(running.clone()) as *mut AtomicBool,
+        Ordering::SeqCst,
+    );
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) == 1 }
 }
 
 fn main() {
@@ -28,8 +81,8 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(rustvoxel::noise::rand_seed),
         world_path: arg("world")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("rustvoxel_world.sav")),
+            .map(PathBuf::from)
+            .unwrap_or_else(default_world_path),
         save_interval_s: 180,
         verbose: true,
         stop_when_empty: false,
@@ -37,24 +90,21 @@ fn main() {
 
     println!("RustVoxel serveur dédié v{}", env!("CARGO_PKG_VERSION"));
     println!("  port {} | motd \"{}\" | {} joueurs max", cfg.port, cfg.motd, cfg.max_players);
+    let world_state = if cfg.world_path.exists() { "chargé" } else { "nouveau" };
+    let world_abs = std::fs::canonicalize(&cfg.world_path).unwrap_or_else(|_| cfg.world_path.clone());
+    println!("  monde: {} ({})", world_abs.display(), world_state);
     println!("  console: /help pour les commandes, /stop pour arrêter");
     let running = Arc::new(AtomicBool::new(true));
-    let r2 = running.clone();
-    // Ctrl+C on unix: default behavior kills the process; save best-effort
-    // happens on /stop. Keep a parked thread so the flag stays meaningful.
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if !r2.load(Ordering::SeqCst) {
-                break;
-            }
+    #[cfg(windows)]
+    {
+        if install_ctrl_handler(&running) {
+            println!("  Ctrl+C / fermeture de fenêtre : sauvegarde automatique");
         }
-    });
+    }
     if let Err(e) = serve(cfg, running) {
         eprintln!("erreur serveur: {e}");
         std::process::exit(1);
     }
+    SAVED.store(true, Ordering::SeqCst);
     println!("serveur arrêté, monde sauvegardé.");
 }
-
-use std::path::PathBuf;

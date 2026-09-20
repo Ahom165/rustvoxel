@@ -6,12 +6,14 @@
 //
 // Console commands: /help /list /time /tp /gamemode /kick /say /seed /save /stop
 //
-// Monde par défaut : <dossier de l'exécutable>/rustvoxel_world.sav — le MÊME
-// fichier que le jeu solo. Le client officiel (via ViaFabricPlus) voit donc le
-// monde du jeu sans option particulière, quel que soit le répertoire de
-// lancement du serveur. Ctrl+C / fermeture de la console (Windows) déclenchent
-// une sauvegarde propre ; chaque sauvegarde préserve la version précédente en
-// .bak.
+// Monde par défaut : <dossier de l'exécutable>/world/ — un DOSSIER au format
+// Anvil vanilla (world/region/r.X.Z.mca). Le monde survit aux redémarrages et
+// peut être un vrai monde de Minecraft : `--world "<.minecraft>/saves/Mon monde"`
+// sert tel quel la sauvegarde du jeu (graine lue dans level.dat, chunks dans
+// region/*.mca). Un ancien rustvoxel_world.sav voisin du dossier world/ est
+// migré automatiquement à la première sauvegarde (le .sav reste en place).
+// `--world fichier.sav` conserve le format historique du jeu solo.
+// Ctrl+C / fermeture de la console (Windows) déclenchent une sauvegarde propre.
 use rustvoxel::server::{serve, default_world_path, ServerConfig};
 use std::path::PathBuf;
 #[cfg(windows)]
@@ -89,8 +91,17 @@ fn main() {
     };
 
     println!("RustVoxel serveur dédié v{}", env!("CARGO_PKG_VERSION"));
-    println!("  port {} | motd \"{}\" | {} joueurs max", cfg.port, cfg.motd, cfg.max_players);
-    let world_state = if cfg.world_path.exists() { "chargé" } else { "nouveau" };
+    println!(
+        "  port {} | motd \"{}\" | {} joueurs max",
+        cfg.port, cfg.motd, cfg.max_players
+    );
+    let world_state = if cfg.world_path.is_file() {
+        "chargé (.sav)"
+    } else if rustvoxel::anvil::dir_has_regions(&cfg.world_path) {
+        "chargé (Anvil)"
+    } else {
+        "nouveau (Anvil)"
+    };
     let world_abs = std::fs::canonicalize(&cfg.world_path).unwrap_or_else(|_| cfg.world_path.clone());
     println!("  monde: {} ({})", world_abs.display(), world_state);
     println!("  console: /help pour les commandes, /stop pour arrêter");

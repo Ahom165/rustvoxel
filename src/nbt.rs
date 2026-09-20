@@ -138,6 +138,14 @@ impl Nbt {
         out.push(TAG_COMPOUND);
         self.write_payload(out);
     }
+
+    /// NBT disque (Anvil, level.dat) : racine compound NOMMÉE — le nom est
+    /// vide mais les 2 octets de longueur sont écrits, comme vanilla.
+    pub fn write_disk(&self, out: &mut Vec<u8>) {
+        out.push(TAG_COMPOUND);
+        write_string(out, "");
+        self.write_payload(out);
+    }
 }
 
 fn write_string(out: &mut Vec<u8>, s: &str) {
@@ -275,6 +283,18 @@ impl<'a> NbtRdr<'a> {
         if tag != TAG_COMPOUND {
             return None;
         }
+        self.compound_body()
+    }
+
+    /// Racine compound NOMMÉE (format disque : level.dat, chunks Anvil) —
+    /// le nom est presque toujours vide mais les 2 octets de longueur sont
+    /// présents et DOIVENT être consommés.
+    pub fn read_disk_root(&mut self) -> Option<Nbt> {
+        let tag = self.u8()?;
+        if tag != TAG_COMPOUND {
+            return None;
+        }
+        let _name = self.string()?;
         self.compound_body()
     }
     pub fn pos(&self) -> usize {

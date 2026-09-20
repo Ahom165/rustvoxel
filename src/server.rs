@@ -115,6 +115,8 @@ impl PlayerS {
 pub struct Server {
     pub cfg: ServerConfig,
     pub world: World,
+    /// Stockage Anvil (<monde>/region/*.mca) — None si format historique .sav.
+    pub anvil: Option<crate::anvil::AnvilStore>,
     pub players: HashMap<u32, PlayerS>,
     pub mobs: Vec<Mob>,
     pub particles: Vec<Particle>,
@@ -134,12 +136,13 @@ pub struct Server {
 /// Chemin de sauvegarde par défaut : le dossier de l'exécutable (même
 /// emplacement que le jeu, app.rs/win32::exe_dir) — insensible au répertoire
 /// courant de lancement, sinon le serveur crée un monde neuf à graine
-/// aléatoire selon d'où il est démarré.
+/// aléatoire selon d'où il est démarré. Le monde est un DOSSIER Anvil
+/// (<dossier>/region/*.mca), comme le « world » d'un serveur vanilla.
 pub fn default_world_path() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("rustvoxel_world.sav")))
-        .unwrap_or_else(|| std::path::PathBuf::from("rustvoxel_world.sav"))
+        .and_then(|p| p.parent().map(|d| d.join("world")))
+        .unwrap_or_else(|| std::path::PathBuf::from("world"))
 }
 
 /// Sauve les chunks modifiés (format RVX2, compatible v0.5+).
@@ -176,6 +179,48 @@ pub fn save_world(w: &World, path: &std::path::Path) -> std::io::Result<()> {
     }
     bw.flush()?;
     Ok(())
+}
+
+/// Ouvre le monde au bon format :
+/// - fichier (ou extension .sav) → format historique RVX2 monofichier ;
+/// - dossier (cas par défaut) → Anvil : chunks dans <dossier>/region/*.mca,
+///   graine dans level.dat si présent (monde vanilla servi tel quel via
+///   `--world <sauvegarde vanilla>`) ; si le dossier est vierge, un ancien
+///   `rustvoxel_world.sav` VOISIN est migré automatiquement (les chunks y
+///   seront réécrits en Anvil à la première sauvegarde, le .sav est conservé).
+fn open_world(cfg: &ServerConfig) -> (World, bool, Option<crate::anvil::AnvilStore>) {
+    let is_sav = cfg
+        .world_path
+        .extension()
+        .map(|e| e == "sav")
+        .unwrap_or(false);
+    if is_sav || cfg.world_path.is_file() {
+        return match load_world(&cfg.world_path) {
+            Some(w) => (w, true, None),
+            None => (World::new(cfg.seed), false, None),
+        };
+    }
+    let store = crate::anvil::AnvilStore::open(&cfg.world_path);
+    if store.has_world_data() {
+        let seed = store.read_seed().unwrap_or(cfg.seed);
+        return (World::new(seed), true, Some(store));
+    }
+    if cfg
+        .world_path
+        .file_name()
+        .map(|n| n == "world")
+        .unwrap_or(false)
+    {
+        if let Some(parent) = cfg.world_path.parent() {
+            let legacy = parent.join("rustvoxel_world.sav");
+            if legacy.is_file() {
+                if let Some(w) = load_world(&legacy) {
+                    return (w, true, Some(store));
+                }
+            }
+        }
+    }
+    (World::new(cfg.seed), false, Some(store))
 }
 
 pub fn load_world(path: &std::path::Path) -> Option<World> {
@@ -485,10 +530,7 @@ impl MobTargets for Targets<'_> {
 
 impl Server {
     pub fn new(cfg: ServerConfig) -> Server {
-        let (world, loaded) = match load_world(&cfg.world_path) {
-            Some(w) => (w, true),
-            None => (World::new(cfg.seed), false),
-        };
+        let (world, loaded, anvil) = open_world(&cfg);
         if cfg.verbose {
             println!(
                 "monde: {} (graine {})",
@@ -499,6 +541,7 @@ impl Server {
         let mut s = Server {
             cfg,
             world,
+            anvil,
             players: HashMap::new(),
             mobs: Vec::new(),
             particles: Vec::new(),
@@ -515,7 +558,7 @@ impl Server {
         };
         for dx in -2..=2 {
             for dz in -2..=2 {
-                s.world.gen_chunk(dx, dz);
+                s.ensure_chunk(dx, dz);
             }
         }
         s.spawn = find_spawn(&s.world);
@@ -1405,7 +1448,31 @@ impl Server {
     }
 
     pub fn save(&mut self) {
-        if save_world(&self.world, &self.cfg.world_path).is_ok() {
+        if self.anvil.is_some() {
+            // colonnes de biome des chunks à écrire (emprunt du cache), PUIS
+            // écriture par régions — les deux emprunts sont séquentiels
+            let coords: Vec<(i32, i32)> = self
+                .world
+                .chunks
+                .iter()
+                .filter(|(_, c)| c.modified)
+                .map(|(k, _)| *k)
+                .collect();
+            let mut biomes = HashMap::new();
+            for &(cx, cz) in &coords {
+                let b = self.biome_column(cx, cz);
+                biomes.insert((cx, cz), b);
+            }
+            match self
+                .anvil
+                .as_mut()
+                .unwrap()
+                .save_world(&self.world, &biomes)
+            {
+                Ok(n) => self.log(&format!("monde sauvegardé (Anvil, {} chunks)", n)),
+                Err(e) => self.log(&format!("échec de sauvegarde Anvil: {}", e)),
+            }
+        } else if save_world(&self.world, &self.cfg.world_path).is_ok() {
             self.log("monde sauvegardé");
         }
     }
@@ -1688,11 +1755,23 @@ impl Server {
         b
     }
 
+    /// Garantit la présence du chunk (cx, cz) : disque Anvil d'abord (chunk
+    /// déjà existant, monde vanilla importé…), génération procédurale ensuite.
+    /// C'est LE point d'entrée unique du contenu de chunk côté serveur.
+    fn ensure_chunk(&mut self, cx: i32, cz: i32) {
+        if self.world.chunks.contains_key(&(cx, cz)) {
+            return;
+        }
+        if let Some(ch) = self.anvil.as_mut().and_then(|st| st.load_chunk(cx, cz)) {
+            self.world.chunks.insert((cx, cz), ch);
+            return;
+        }
+        self.world.gen_chunk(cx, cz);
+    }
+
     /// Paquet map_chunk complet pour (cx, cz).
     fn chunk_packet(&mut self, cx: i32, cz: i32) -> Vec<u8> {
-        if !self.world.chunks.contains_key(&(cx, cz)) {
-            self.world.gen_chunk(cx, cz);
-        }
+        self.ensure_chunk(cx, cz);
         let biomes = self.biome_column(cx, cz);
         let (cdata, light) = encode_chunk_packet_data(&self.world, cx, cz, &biomes);
         let hm = heightmaps_nbt(self.world.chunks.get(&(cx, cz)).unwrap());
@@ -1738,7 +1817,7 @@ impl Server {
                     if gen_budget == 0 {
                         break;
                     }
-                    self.world.gen_chunk(cx, cz);
+                    self.ensure_chunk(cx, cz);
                     gen_budget -= 1;
                 }
                 // envoi (plus proche d'abord)
@@ -2951,9 +3030,89 @@ mod tests {
         assert!(p.is_absolute(), "chemin absolu attendu, obtenu {:?}", p);
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
-            Some("rustvoxel_world.sav"),
-            "même nom de sauvegarde que le jeu solo"
+            Some("world"),
+            "dossier de monde Anvil, comme un serveur vanilla"
         );
+    }
+
+    #[test]
+    fn anvil_world_persists_across_servers() {
+        // Un serveur avec un monde DOSSIER (Anvil) : édition, /save, nouveau
+        // serveur → les blocs exacts (dont familles ambiguës via rvx) sont
+        // restitués bit à bit.
+        let base = std::env::temp_dir().join(format!("rvx_anvil_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wdir = base.join("world");
+        let mut cfg = ServerConfig::local(wdir.clone(), Some(42));
+        cfg.verbose = false;
+        {
+            let mut srv = Server::new(cfg.clone());
+            srv.world.set_block(5, 70, 5, crate::world::WOOL_COLOR_BASE + 14); // laine rouge
+            srv.world.set_block(6, 70, 5, crate::world::WOOL_SLAB_BASE + 3); // dalle laine (nom ambigu)
+            srv.world.set_block(7, 70, 5, crate::world::CHERRY_LOG);
+            srv.world.set_block(8, 70, 5, crate::world::WATER);
+            srv.save();
+            assert!(crate::anvil::dir_has_regions(&wdir), "région écrite");
+        }
+        let srv2 = Server::new(cfg.clone());
+        assert_eq!(srv2.world.seed, 42);
+        assert_eq!(
+            srv2.world.get_block(5, 70, 5),
+            crate::world::WOOL_COLOR_BASE + 14,
+            "laine rouge exacte (nom coloré)"
+        );
+        assert_eq!(
+            srv2.world.get_block(6, 70, 5),
+            crate::world::WOOL_SLAB_BASE + 3,
+            "dalle laine exacte (rvx)"
+        );
+        assert_eq!(srv2.world.get_block(7, 70, 5), crate::world::CHERRY_LOG);
+        assert_eq!(srv2.world.get_block(8, 70, 5), crate::world::WATER);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn legacy_sav_migrates_to_anvil_dir() {
+        // Ancien monde .sav voisin du dossier « world » : chargé puis réécrit
+        // en Anvil à la première sauvegarde ; le .sav reste en place.
+        let base = std::env::temp_dir().join(format!("rvx_migr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wdir = base.join("world");
+        let legacy = base.join("rustvoxel_world.sav");
+        let mut w = World::new(7);
+        w.gen_chunk(0, 0);
+        w.set_block(3, 40, 3, crate::world::PLANKS);
+        save_world(&w, &legacy).unwrap();
+        let mut cfg = ServerConfig::local(wdir.clone(), Some(999));
+        cfg.verbose = false;
+        {
+            let mut srv = Server::new(cfg.clone());
+            assert_eq!(srv.world.seed, 7, "graine du .sav migré");
+            assert_eq!(srv.world.get_block(3, 40, 3), crate::world::PLANKS);
+            srv.save();
+        }
+        assert!(crate::anvil::dir_has_regions(&wdir), "migration écrite en Anvil");
+        assert!(legacy.exists(), "le .sav d’origine est conservé");
+        let srv2 = Server::new(cfg);
+        assert_eq!(srv2.world.get_block(3, 40, 3), crate::world::PLANKS);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn anvil_sav_paths_stay_legacy() {
+        // Un --world explicite en .sav garde le comportement historique
+        // (aucune migration, aucune région écrite).
+        let path = std::env::temp_dir().join(format!("rvx_legacy_{}.sav", std::process::id()));
+        let mut cfg = ServerConfig::local(path.clone(), Some(5));
+        cfg.verbose = false;
+        let mut srv = Server::new(cfg.clone());
+        assert!(srv.anvil.is_none(), "format .sav = pas de store Anvil");
+        srv.world.set_block(2, 50, 2, crate::world::BRICK);
+        srv.save();
+        assert!(!path.is_dir(), "pas de dossier créé pour un .sav");
+        let w2 = load_world(&path).unwrap();
+        assert_eq!(w2.get_block(2, 50, 2), crate::world::BRICK);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

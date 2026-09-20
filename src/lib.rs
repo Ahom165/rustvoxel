@@ -4,6 +4,7 @@
 // or the `fficheck` feature so tests run everywhere.
 #![allow(dead_code)]
 
+pub mod anvil;
 pub mod client;
 pub mod entity_data;
 pub mod entity_models;

@@ -1,6 +1,6 @@
 [package]
 name = "rustvoxel"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 description = "Original voxel sandbox engine in pure Rust - zero external crates (client + multiplayer server)"
 

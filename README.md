@@ -83,6 +83,39 @@ etc.) au lieu d'un message nu ; trace réseau optionnelle côté serveur
 (`RV_DEBUG=1 rustvoxel_server`) pour diagnostiquer les problèmes de connexion
 paquet par paquet.
 
+## Nouveauté v0.7.4 — Persistance du monde au format Anvil vanilla
+
+Le monde du serveur dédié est désormais sauvegardé **au format Anvil de
+Minecraft** (`world/region/r.X.Z.mca` + NBT), plus un `.sav` maison :
+
+- **persistance réelle** : chaque chunk modifié est réécrit dans sa région
+  (sauvegarde toutes les minutes, à `/save` et à l'arrêt, Ctrl+C inclus) ;
+  les chunks intacts d'une région sont préservés **octet pour octet** ;
+- **les mondes vanilla sont servis tels quels** :
+  `rustvoxel_server --world "<.minecraft>/saves/Mon monde"` charge les chunks
+  de `region/*.mca` et la graine de `level.dat` — palette vanilla (Name +
+  Properties), sections 1.18+, zlib (niveau quelconque, Huffman dynamique) et
+  gzip lus par notre inflate maison ;
+- **round-trip exact** : les palettes écrites portent les vrais noms colorés
+  (`red_wool`, `light_blue_concrete`…) et, pour les blocs ambigus (dalles /
+  escaliers de laine), une propriété `rvx` (id interne) que vanilla ignore
+  silencieusement — le monde rechargé est bit à bit identique ;
+- **chargement paresseux** par région avec cache LRU : un gros monde vanilla
+  (des centaines de fichiers région) est exploré sans tout charger ;
+- le monde par défaut devient le **dossier** `<exe>/world/` ; un ancien
+  `rustvoxel_world.sav` voisin est migré automatiquement à la première
+  sauvegarde (le .sav reste en place) ; `--world fichier.sav` garde le
+  format historique du jeu solo ;
+- **zéro dépendance conservée** : compresseur DEFLATE fixed-Huffman + LZ77
+  (RFC 1951), conteneurs zlib (RFC 1950) et gzip (RFC 1952), lecteur NBT
+  disque à racine nommée — réunis dans `src/anvil.rs` ;
+- tests : round-trip région + slots préservés, palettes vanilla sans `rvx`,
+  alias (tall_grass, ice, clay…), graine `level.dat` (vecteur réel zlib
+  Python Huffman dynamique), migration .sav → Anvil ; E2E `scripts/
+  e2e_anvil_check.py` (creuser → /save → redémarrer → recharger) et
+  `scripts/e2e_vanilla_region.py` (région écrite par un outil tiers, relue
+  et round-tripée par le serveur).
+
 ## Correctif v0.7.1 — Connexion client Java officielle (ViaVersion) réparée
 
 Le client Java officiel (testé 26.3 via ViaFabricPlus) plantait dès le login.

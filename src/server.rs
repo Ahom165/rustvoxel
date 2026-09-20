@@ -716,6 +716,15 @@ impl Server {
         if let Some(p) = self.players.get(&id) {
             self.send(p, cb::UPDATE_VIEW_POSITION, &pkt);
         }
+        // Game Event 13 « Start waiting for level chunks » (1.20.3+) : côté
+        // client, LevelLoadStatusManager passe de WAITING_FOR_SERVER à
+        // WAITING_FOR_PLAYER_CHUNK uniquement à la réception de cet événement ;
+        // sans lui, l'écran « Loading terrain » (ReceivingLevelScreen) ne se
+        // ferme qu'au failsafe des 30 s — soft-lock d'entrée en monde observé.
+        let pkt = W2::new().u8v(13).f32v(0.0).done();
+        if let Some(p) = self.players.get(&id) {
+            self.send(p, cb::GAME_STATE_CHANGE, &pkt);
+        }
         // hotbar par défaut (slot 0)
         if creative {
             let item = vd::item_id_for_block(crate::world::STONE);
@@ -2624,6 +2633,44 @@ mod tests {
         let mut rr = R2::new(&r);
         assert_eq!(rr.vi(), Some(0x01));
         assert_eq!(rr.i64v(), Some(1234567));
+
+        running.store(false, Ordering::SeqCst);
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn game_event_13_precedes_chunks_vanilla() {
+        // LevelLoadStatusManager côté client vanilla : WAITING_FOR_SERVER ->
+        // WAITING_FOR_PLAYER_CHUNK uniquement sur Game Event 13 (« Start
+        // waiting for level chunks », 1.20.3+). Sans lui, l'écran « Loading
+        // terrain » reste affiché jusqu'au failsafe de 30 s (soft-lock).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = test_cfg("ge13");
+        let running = Arc::new(AtomicBool::new(true));
+        let r2 = running.clone();
+        let jh = std::thread::spawn(move || serve_listener(listener, cfg, r2, None).unwrap());
+
+        let mut c = VClient::login(addr, "Ge13");
+        let mut saw_ge13 = false;
+        loop {
+            let (id, payload) = c.recv();
+            if id == cb::GAME_STATE_CHANGE {
+                assert!(!saw_ge13, "game event 13 envoyé deux fois au join");
+                let mut rr = R2::new(&payload);
+                assert_eq!(
+                    rr.u8v(),
+                    Some(13),
+                    "l'événement doit être 13 (waiting for level chunks)"
+                );
+                assert_eq!(rr.f32v(), Some(0.0));
+                saw_ge13 = true;
+            } else if id == cb::CHUNK_BATCH_START || id == cb::MAP_CHUNK {
+                assert!(saw_ge13, "le game event 13 doit précéder l'envoi des chunks");
+                break;
+            }
+        }
+        assert!(saw_ge13, "game event 13 attendu à l'entrée en monde");
 
         running.store(false, Ordering::SeqCst);
         jh.join().unwrap();

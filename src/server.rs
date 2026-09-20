@@ -726,6 +726,10 @@ impl Server {
                 }
             }
         }
+        // slot actif 0 (Set Carried Item, attendu à l'entrée en monde)
+        if let Some(p) = self.players.get(&id) {
+            self.send(p, cb::HELD_ITEM_SLOT, &W2::new().vi(0).done());
+        }
         // liste des joueurs déjà en ligne (tab)
         let entries: Vec<([u8; 16], String, bool, i32)> = self
             .players
@@ -1737,7 +1741,19 @@ impl Server {
                     pkts.push(frame(cb::MAP_CHUNK, &pkt));
                 }
                 if !pkts.is_empty() {
-                    out.push((pid, pkts));
+                    // 1.20.2+ : toute rafale de chunks est un « batch » encadré
+                    // par start/finished ; sans finished, le client officiel
+                    // reste bloqué sur l'écran « téléchargement du terrain »
+                    // (soft-lock observé sur client 26.3 via ViaFabricPlus).
+                    let batch_size = pkts.len() as i32;
+                    let mut burst = Vec::with_capacity(pkts.len() + 2);
+                    burst.push(frame(cb::CHUNK_BATCH_START, &[]));
+                    burst.append(&mut pkts);
+                    burst.push(frame(
+                        cb::CHUNK_BATCH_FINISHED,
+                        &W2::new().vi(batch_size).done(),
+                    ));
+                    out.push((pid, burst));
                 }
                 // chunks à décharger
                 let mut gone = Vec::new();
@@ -2608,6 +2624,50 @@ mod tests {
         let mut rr = R2::new(&r);
         assert_eq!(rr.vi(), Some(0x01));
         assert_eq!(rr.i64v(), Some(1234567));
+
+        running.store(false, Ordering::SeqCst);
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn chunks_stream_in_batches_vanilla() {
+        // 1.20.2+ : le client ne quitte l'écran « téléchargement du terrain »
+        // qu'à la réception d'un chunk batch finished. Chaque rafale doit donc
+        // être encadrée : start -> MAP_CHUNK* -> finished(batchSize).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = test_cfg("batches");
+        let running = Arc::new(AtomicBool::new(true));
+        let r2 = running.clone();
+        let jh = std::thread::spawn(move || serve_listener(listener, cfg, r2, None).unwrap());
+
+        let mut c = VClient::login(addr, "Batch");
+        let _ = c.recv_until(cb::POSITION);
+
+        // collecte les frames jusqu'au premier finished précédé d'au moins 1 chunk
+        let mut since_start: i32 = -1;
+        loop {
+            let (id, payload) = c.recv();
+            if id == cb::CHUNK_BATCH_START {
+                since_start = 0;
+            } else if id == cb::MAP_CHUNK {
+                if since_start >= 0 {
+                    since_start += 1;
+                }
+            } else if id == cb::CHUNK_BATCH_FINISHED {
+                assert!(
+                    since_start > 0,
+                    "finished reçu sans start préalable ni chunk"
+                );
+                let mut rr = R2::new(&payload);
+                assert_eq!(
+                    rr.vi(),
+                    Some(since_start),
+                    "batchSize doit compter les chunks du batch"
+                );
+                break;
+            }
+        }
 
         running.store(false, Ordering::SeqCst);
         jh.join().unwrap();

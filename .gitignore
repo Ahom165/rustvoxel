@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+*.sav
+# pas de textures Mojang redistribuées dans le dépôt public :
+# le pack se télécharge côté utilisateur (voir texturepacks/README.txt)
+texturepacks/*.zip

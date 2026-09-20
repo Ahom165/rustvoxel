@@ -1,0 +1,32 @@
+[package]
+name = "rustvoxel"
+version = "0.7.3"
+edition = "2021"
+description = "Original voxel sandbox engine in pure Rust - zero external crates (client + multiplayer server)"
+
+# ZERO dependencies: Win32 + OpenGL are loaded through hand-written FFI.
+# Networking is plain std::net TCP with a hand-rolled binary protocol.
+[dependencies]
+
+[features]
+# Type-checks the Windows FFI code on non-Windows hosts (used by CI / cargo test).
+fficheck = []
+
+[lib]
+name = "rustvoxel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustvoxel"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustvoxel_server"
+path = "src/bin/rustvoxel_server.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
